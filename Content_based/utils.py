@@ -26,32 +26,7 @@ def prefilter_items(data):
     # Уберем слишком дешевые товары (на них не заработаем). 1 покупка из рассылок стоит 60 руб. 
     
     # Уберем слишком дорогие товары
+    return data
 
 def postfilter_items(user_id, recommendations):
     pass
-
-def get_recommendations(user, model, sparse_user_item, id_to_itemid, userid_to_id, itemid_to_id, N=5):
-    """Рекомендуем топ-N товаров"""
-    
-    res = [id_to_itemid[rec] for rec in 
-                    model.recommend(userid=userid_to_id[user], 
-                                    user_items=sparse_user_item,
-                                    N=N, 
-                                    filter_already_liked_items=False, 
-                                    filter_items=[itemid_to_id[999999]], 
-                                    recalculate_user=True)[0]]
-    return res
-
-def get_similar_items_recommendation(user, model, N=5):
-    """Рекомендуем товары, похожие на топ-N купленных юзером товаров"""
-    
-    pass
-    
-    return res
-
-def get_similar_users_recommendation(user, model, N=5):
-    """Рекомендуем топ-N товаров, среди купленных похожими юзерами"""
-    
-    pass
-    
-    return res

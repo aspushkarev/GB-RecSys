@@ -12,33 +12,62 @@ Original file is located at
 from implicit.nearest_neighbours import ItemItemRecommender
 from implicit.als import AlternatingLeastSquares
 
-class MainRecommender(ItemItemRecommender):
+class MainRecommender:
 
-    def __init__(self, K=5, num_threads=4):
-        self.similarity = None
-        self.filter_already_liked_items=False
-        self.K = K
-        self.num_threads = num_threads
-     
+    def __init__(self, data, weighting=None, fake_id=999999):
+        
+        # топ покупок каждого пользователя
+        self.top_purchases = data.groupby(['user_id', 'item_id'])['quantity'].count().reset_index()
+        self.top_purchases.sort_values('quantity', ascending=False, inplace=True)
+
+        if fake_id is not None:
+          self.top_purchases = self.top_purchases[self.top_purchases['item_id'] != fake_id]
+        
+        # топ покупок по всему датасету
+        self.overall_top_parcheses = data.groupby('item_id')['quantity'].count().reset_index()
+        self.overall_top_parcheses.sort_values('quantity', ascending=False, inplace=True)
+
+        if fake_id is not None:
+          self.overall_top_parcheses = self.overall_top_parcheses[self.overall_top_parcheses['item_id'] != fake_id]
+        self.overall_top_parcheses = self.overall_top_parcheses['item_id'].tolist()
+
+        self.fake_id = fake_id
+        self.user_item_matrix = self.prepare_matrix(data)
+        self.id_to_itemid, self.id_to_userid, \
+        self.itemid_to_id, self.userid_to_id = self.prepare_dicts(self.user_item_matrix)
+
+        self.user_item_matrix = csr_matrix(self.user_item_matrix).tocsr()
+        self.user_item_matrix_for_pred = self.user_item_matrix
+
+        if weighting == 'bm25':
+          self.user_item_matrix = bm25_weight(self.user_item_matrix.T).T.tocsr()
+
+        if weighting == 'tfidf':
+          self.user_item_matrix = tfidf_weight(self.user_item_matrix.T).T.tocsr()
+
+        self.model = self.fit(self.user_item_matrix)
+        self.own_recommender = self.fit_own_recommender(self.user_item_matrix)
+
 
     @staticmethod
     def prepare_matrix(data_train):
         
         user_item_matrix = pd.pivot_table(data_train, 
-                                  index='user_id', columns='item_id', 
+                                  index='user_id',
+                                  columns='item_id', 
                                   values='quantity',
                                   aggfunc='count', 
-                                  fill_value=0
-                                 )
+                                  fill_value=0)
 
         user_item_matrix = user_item_matrix.astype(float)
-        sparse_user_item = csr_matrix(user_item_matrix).tocsr()
+        # sparse_user_item = csr_matrix(user_item_matrix).tocsr()
         
-        return user_item_matrix, sparse_user_item
+        return user_item_matrix
     
 
     @staticmethod
     def prepare_dicts(user_item_matrix):
+
         """Подготавливает вспомогательные словари"""
         
         userids = user_item_matrix.index.values
@@ -54,7 +83,7 @@ class MainRecommender(ItemItemRecommender):
         userid_to_id = dict(zip(userids, matrix_userids))
         
         return id_to_itemid, id_to_userid, itemid_to_id, userid_to_id
-     
+        
 
     @staticmethod
     def fit_own_recommender(user_item_matrix):
@@ -64,54 +93,119 @@ class MainRecommender(ItemItemRecommender):
         """
     
         own_recommender = ItemItemRecommender(K=1, num_threads=4)
-        own_recommender.fit(csr_matrix(user_item_matrix).T.tocsr(), show_progress=True)
+        own_recommender.fit(user_item_matrix)
         
         return own_recommender
 
 
     @staticmethod
-    def fit(sparse_user_item, n_factors=20, regularization=0.001, iterations=15, num_threads=4):
+    def fit(user_item_matrix,
+            n_factors=20,
+            regularization=0.01,
+            iterations=15,
+            num_threads=4):
         
         model = AlternatingLeastSquares(factors=n_factors, 
-                                             regularization=regularization,
-                                             iterations=iterations,  
-                                             num_threads=num_threads)
-        model.fit(sparse_user_item, show_progress=True)
-        # model.fit(csr_matrix(user_item_matrix).T.tocsr(), 
-          # show_progress=True)
+                                        regularization=regularization,
+                                        iterations=iterations,  
+                                        num_threads=num_threads)
+        model.fit(user_item_matrix)
         
         return model
 
-    @staticmethod
-    def get_similar_items_recommendation(model, user, id_to_itemid, \
-                                         userid_to_id, \
-                                         sparse_user_item, N=5):
+
+    def update_dict(self, user_id):
+
+        """Если появился новый пользователь, то обновляем словари"""
+  
+        if user_id not in self.userid_to_id.key():
+            max_id = max(list(self.userid_to_id.values()))
+            max_id += 1
+
+            self.userid_to_id.update({user_id: max_id})
+            self.id_to_userid.update({max_id: user_id})
+
+
+    def get_similar_item(self, item_id):
+
+        """Находим товар похожий на item_id"""
+
+        recs = self.model.similar_items(self.itemid_to_id[item_id], N=2)  # N=2 товар похожий на себя
+        top_rec = recs[1][0]  # берём второй товар
+
+        return self.id_to_itemid[top_rec]
+
+
+    def extend_with_top_popular(self, recommendations, N=5):
+
+        """Если количество рекомендаций меньше топ N, то дополняем топ-популярными"""
+
+        if len(recommendations) < N:
+            top_popular = [rec for rec in self.overall_top_parcheses[:N] if rec not in recommendations]
+            recommendations.extend(top_popular)
+            recommendations = recommendations[:N]
+
+        return recommendations
+
+
+    def get_recommendations(self, user, model, N=5):
+
+        """Рекомендуем топ-N товаров"""
+
+        self.update_dict(user_id=user)
+        filter_items = [] if self.fake_id is not None else [self.itemid_to_id[self.fake_id]]
+        res = model.recommend(userid=self.userid_to_id[user], 
+                              user_items=self.user_item_matrix[self.userid_to_id[user]],
+                              N=N, 
+                              filter_already_liked_items=False, 
+                              filter_items=filter_items, 
+                              recalculate_user=True)
+        mask = res[1].argsort()[::-1]
+        res = [self.id_to_itemid[rec] for rec in res[0][mask]]
+        res = self.extend_with_top_popular(res, N=N)
+
+        assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
+
+        return res
+
+
+    def get_als_recommendations(self, user, N=5):
+
+        return self.get_recommendations(user, model=self.model, N=N)
+
+
+    def get_own_recommendations(self, user, N=5):
+
+        """Рекомендуем товары, которые пользователь уже купил"""
+
+        return self.get_recommendations(user, model=self.own_recommender, N=N)
+
+
+    def get_similar_items_recommendation(self, user, N=5):
+
         """Рекомендуем товары, похожие на топ-N купленных юзером товаров"""
 
-        res = [id_to_itemid[rec] for rec in 
-                      model.recommend(userid=userid_to_id[user], 
-                                      user_items=sparse_user_item,
-                                      N=N, 
-                                      filter_already_liked_items=False, 
-                                      filter_items=None,
-                                      recalculate_user=True)[0]]
+        top_items = self.user_item_matrix.loc[user].sort_values(ascending=False).head(N).index.tolist()
+        top_items = [self.itemid_to_id[item] for item in top_items]
+
+        ids = self.model.similar_items(top_items ,N=N+1)[0][:,1:].T.flatten()[:N]
+        res = [self.id_to_itemid[x] for x in ids]
 
         assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
+
         return res
     
-    @staticmethod
-    def get_similar_users_recommendation(model, user, id_to_itemid, \
-                                        userid_to_id, \
-                                        sparse_user_item, N=5):
+   
+    def get_similar_users_recommendation(self, user, N=5):
+
         """Рекомендуем топ-N товаров, среди купленных похожими юзерами"""
     
-        res = [id_to_itemid[rec] for rec in 
-                  model.recommend(userid=userid_to_id[user], 
-                                  user_items=sparse_user_item[userid_to_id[user]],
-                                  N=N, 
-                                  filter_already_liked_items=False, 
-                                  filter_items=[itemid_to_id[999999]], 
-                                  recalculate_user=True)[0]]
+        top_items = self.user_item_matrix.loc[user].sort_values(ascending=False).head(N).index.tolist()
+        top_items = [self.itemid_to_id[item] for item in top_items]
+        
+        ids = self.model.similar_items(top_items ,N=N+1)[0][:,1:].T.flatten()[:N]
+        res = [self.id_to_itemid[x] for x in ids]
 
         assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
+
         return res
